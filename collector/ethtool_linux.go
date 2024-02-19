@@ -27,15 +27,16 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 
+	"github.com/alecthomas/kingpin/v2"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/procfs/sysfs"
 	"github.com/safchain/ethtool"
 	"golang.org/x/sys/unix"
-	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 var (
@@ -73,8 +74,9 @@ func (e *ethtoolLibrary) LinkInfo(intf string) (ethtool.EthtoolCmd, error) {
 type ethtoolCollector struct {
 	fs             sysfs.FS
 	entries        map[string]*prometheus.Desc
+	entriesMutex   sync.Mutex
 	ethtool        Ethtool
-	deviceFilter   netDevFilter
+	deviceFilter   deviceFilter
 	infoDesc       *prometheus.Desc
 	metricsPattern *regexp.Regexp
 	logger         log.Logger
@@ -98,7 +100,7 @@ func makeEthtoolCollector(logger log.Logger) (*ethtoolCollector, error) {
 	return &ethtoolCollector{
 		fs:             fs,
 		ethtool:        &ethtoolLibrary{e},
-		deviceFilter:   newNetDevFilter(*ethtoolDeviceExclude, *ethtoolDeviceInclude),
+		deviceFilter:   newDeviceFilter(*ethtoolDeviceExclude, *ethtoolDeviceInclude),
 		metricsPattern: regexp.MustCompile(*ethtoolIncludedMetrics),
 		logger:         logger,
 		entries: map[string]*prometheus.Desc{
@@ -233,9 +235,9 @@ func (c *ethtoolCollector) updatePortCapabilities(ch chan<- prometheus.Metric, p
 	if linkModes&(1<<unix.ETHTOOL_LINK_MODE_Asym_Pause_BIT) != 0 {
 		asymmetricPause = 1.0
 	}
-	ch <- prometheus.MustNewConstMetric(c.entries[fmt.Sprintf("%s_autonegotiate", prefix)], prometheus.GaugeValue, autonegotiate, device)
-	ch <- prometheus.MustNewConstMetric(c.entries[fmt.Sprintf("%s_pause", prefix)], prometheus.GaugeValue, pause, device)
-	ch <- prometheus.MustNewConstMetric(c.entries[fmt.Sprintf("%s_asymmetricpause", prefix)], prometheus.GaugeValue, asymmetricPause, device)
+	ch <- prometheus.MustNewConstMetric(c.entry(fmt.Sprintf("%s_autonegotiate", prefix)), prometheus.GaugeValue, autonegotiate, device)
+	ch <- prometheus.MustNewConstMetric(c.entry(fmt.Sprintf("%s_pause", prefix)), prometheus.GaugeValue, pause, device)
+	ch <- prometheus.MustNewConstMetric(c.entry(fmt.Sprintf("%s_asymmetricpause", prefix)), prometheus.GaugeValue, asymmetricPause, device)
 }
 
 // updatePortInfo generates port type metrics to indicate if the network devices supports Twisted Pair, optical fiber, etc.
@@ -251,7 +253,7 @@ func (c *ethtoolCollector) updatePortInfo(ch chan<- prometheus.Metric, device st
 		"Backplane": unix.ETHTOOL_LINK_MODE_Backplane_BIT,
 	} {
 		if linkModes&(1<<bit) != 0 {
-			ch <- prometheus.MustNewConstMetric(c.entries["supported_port"], prometheus.GaugeValue, 1.0, device, name)
+			ch <- prometheus.MustNewConstMetric(c.entry("supported_port"), prometheus.GaugeValue, 1.0, device, name)
 		}
 
 	}
@@ -274,32 +276,87 @@ func (c *ethtoolCollector) updateSpeeds(ch chan<- prometheus.Metric, prefix stri
 		duplex string
 		phy    string
 	}{
-		unix.ETHTOOL_LINK_MODE_10baseT_Half_BIT:       {10, half, "T"},
-		unix.ETHTOOL_LINK_MODE_10baseT_Full_BIT:       {10, full, "T"},
-		unix.ETHTOOL_LINK_MODE_100baseT_Half_BIT:      {100, half, "T"},
-		unix.ETHTOOL_LINK_MODE_100baseT_Full_BIT:      {100, full, "T"},
-		unix.ETHTOOL_LINK_MODE_1000baseT_Half_BIT:     {1000, half, "T"},
-		unix.ETHTOOL_LINK_MODE_1000baseT_Full_BIT:     {1000, full, "T"},
-		unix.ETHTOOL_LINK_MODE_10000baseT_Full_BIT:    {10000, full, "T"},
-		unix.ETHTOOL_LINK_MODE_2500baseT_Full_BIT:     {2500, full, "T"},
-		unix.ETHTOOL_LINK_MODE_1000baseKX_Full_BIT:    {1000, full, "KX"},
-		unix.ETHTOOL_LINK_MODE_10000baseKX4_Full_BIT:  {10000, full, "KX4"},
-		unix.ETHTOOL_LINK_MODE_10000baseKR_Full_BIT:   {10000, full, "KR"},
-		unix.ETHTOOL_LINK_MODE_10000baseR_FEC_BIT:     {10000, full, "R_FEC"},
-		unix.ETHTOOL_LINK_MODE_20000baseMLD2_Full_BIT: {20000, full, "MLD2"},
-		unix.ETHTOOL_LINK_MODE_20000baseKR2_Full_BIT:  {20000, full, "KR2"},
-		unix.ETHTOOL_LINK_MODE_40000baseKR4_Full_BIT:  {40000, full, "KR4"},
-		unix.ETHTOOL_LINK_MODE_40000baseCR4_Full_BIT:  {40000, full, "CR4"},
-		unix.ETHTOOL_LINK_MODE_40000baseSR4_Full_BIT:  {40000, full, "SR4"},
-		unix.ETHTOOL_LINK_MODE_40000baseLR4_Full_BIT:  {40000, full, "LR4"},
-		unix.ETHTOOL_LINK_MODE_56000baseKR4_Full_BIT:  {56000, full, "KR4"},
-		unix.ETHTOOL_LINK_MODE_56000baseCR4_Full_BIT:  {56000, full, "CR4"},
-		unix.ETHTOOL_LINK_MODE_56000baseSR4_Full_BIT:  {56000, full, "SR4"},
-		unix.ETHTOOL_LINK_MODE_56000baseLR4_Full_BIT:  {56000, full, "LR4"},
-		unix.ETHTOOL_LINK_MODE_25000baseCR_Full_BIT:   {25000, full, "CR"},
+		unix.ETHTOOL_LINK_MODE_10baseT_Half_BIT:               {10, half, "T"},
+		unix.ETHTOOL_LINK_MODE_10baseT_Full_BIT:               {10, full, "T"},
+		unix.ETHTOOL_LINK_MODE_100baseT_Half_BIT:              {100, half, "T"},
+		unix.ETHTOOL_LINK_MODE_100baseT_Full_BIT:              {100, full, "T"},
+		unix.ETHTOOL_LINK_MODE_1000baseT_Half_BIT:             {1000, half, "T"},
+		unix.ETHTOOL_LINK_MODE_1000baseT_Full_BIT:             {1000, full, "T"},
+		unix.ETHTOOL_LINK_MODE_10000baseT_Full_BIT:            {10000, full, "T"},
+		unix.ETHTOOL_LINK_MODE_2500baseT_Full_BIT:             {2500, full, "T"},
+		unix.ETHTOOL_LINK_MODE_1000baseKX_Full_BIT:            {1000, full, "KX"},
+		unix.ETHTOOL_LINK_MODE_10000baseKX4_Full_BIT:          {10000, full, "KX4"},
+		unix.ETHTOOL_LINK_MODE_10000baseKR_Full_BIT:           {10000, full, "KR"},
+		unix.ETHTOOL_LINK_MODE_10000baseR_FEC_BIT:             {10000, full, "R_FEC"},
+		unix.ETHTOOL_LINK_MODE_20000baseMLD2_Full_BIT:         {20000, full, "MLD2"},
+		unix.ETHTOOL_LINK_MODE_20000baseKR2_Full_BIT:          {20000, full, "KR2"},
+		unix.ETHTOOL_LINK_MODE_40000baseKR4_Full_BIT:          {40000, full, "KR4"},
+		unix.ETHTOOL_LINK_MODE_40000baseCR4_Full_BIT:          {40000, full, "CR4"},
+		unix.ETHTOOL_LINK_MODE_40000baseSR4_Full_BIT:          {40000, full, "SR4"},
+		unix.ETHTOOL_LINK_MODE_40000baseLR4_Full_BIT:          {40000, full, "LR4"},
+		unix.ETHTOOL_LINK_MODE_56000baseKR4_Full_BIT:          {56000, full, "KR4"},
+		unix.ETHTOOL_LINK_MODE_56000baseCR4_Full_BIT:          {56000, full, "CR4"},
+		unix.ETHTOOL_LINK_MODE_56000baseSR4_Full_BIT:          {56000, full, "SR4"},
+		unix.ETHTOOL_LINK_MODE_56000baseLR4_Full_BIT:          {56000, full, "LR4"},
+		unix.ETHTOOL_LINK_MODE_25000baseCR_Full_BIT:           {25000, full, "CR"},
+		unix.ETHTOOL_LINK_MODE_25000baseKR_Full_BIT:           {25000, full, "KR"},
+		unix.ETHTOOL_LINK_MODE_25000baseSR_Full_BIT:           {25000, full, "SR"},
+		unix.ETHTOOL_LINK_MODE_50000baseCR2_Full_BIT:          {50000, full, "CR2"},
+		unix.ETHTOOL_LINK_MODE_50000baseKR2_Full_BIT:          {50000, full, "KR2"},
+		unix.ETHTOOL_LINK_MODE_100000baseKR4_Full_BIT:         {100000, full, "KR4"},
+		unix.ETHTOOL_LINK_MODE_100000baseSR4_Full_BIT:         {100000, full, "SR4"},
+		unix.ETHTOOL_LINK_MODE_100000baseCR4_Full_BIT:         {100000, full, "CR4"},
+		unix.ETHTOOL_LINK_MODE_100000baseLR4_ER4_Full_BIT:     {100000, full, "R4_ER4"},
+		unix.ETHTOOL_LINK_MODE_50000baseSR2_Full_BIT:          {50000, full, "SR2"},
+		unix.ETHTOOL_LINK_MODE_1000baseX_Full_BIT:             {1000, full, "X"},
+		unix.ETHTOOL_LINK_MODE_10000baseCR_Full_BIT:           {10000, full, "CR"},
+		unix.ETHTOOL_LINK_MODE_10000baseSR_Full_BIT:           {10000, full, "SR"},
+		unix.ETHTOOL_LINK_MODE_10000baseLR_Full_BIT:           {10000, full, "LR"},
+		unix.ETHTOOL_LINK_MODE_10000baseLRM_Full_BIT:          {10000, full, "LRM"},
+		unix.ETHTOOL_LINK_MODE_10000baseER_Full_BIT:           {10000, full, "ER"},
+		unix.ETHTOOL_LINK_MODE_5000baseT_Full_BIT:             {5000, full, "T"},
+		unix.ETHTOOL_LINK_MODE_50000baseKR_Full_BIT:           {50000, full, "KR"},
+		unix.ETHTOOL_LINK_MODE_50000baseSR_Full_BIT:           {50000, full, "SR"},
+		unix.ETHTOOL_LINK_MODE_50000baseCR_Full_BIT:           {50000, full, "CR"},
+		unix.ETHTOOL_LINK_MODE_50000baseLR_ER_FR_Full_BIT:     {50000, full, "LR_ER_FR"},
+		unix.ETHTOOL_LINK_MODE_50000baseDR_Full_BIT:           {50000, full, "DR"},
+		unix.ETHTOOL_LINK_MODE_100000baseKR2_Full_BIT:         {100000, full, "KR2"},
+		unix.ETHTOOL_LINK_MODE_100000baseSR2_Full_BIT:         {100000, full, "SR2"},
+		unix.ETHTOOL_LINK_MODE_100000baseCR2_Full_BIT:         {100000, full, "CR2"},
+		unix.ETHTOOL_LINK_MODE_100000baseLR2_ER2_FR2_Full_BIT: {100000, full, "LR2_ER2_FR2"},
+		unix.ETHTOOL_LINK_MODE_100000baseDR2_Full_BIT:         {100000, full, "DR2"},
+		unix.ETHTOOL_LINK_MODE_200000baseKR4_Full_BIT:         {200000, full, "KR4"},
+		unix.ETHTOOL_LINK_MODE_200000baseSR4_Full_BIT:         {200000, full, "SR4"},
+		unix.ETHTOOL_LINK_MODE_200000baseLR4_ER4_FR4_Full_BIT: {200000, full, "LR4_ER4_FR4"},
+		unix.ETHTOOL_LINK_MODE_200000baseDR4_Full_BIT:         {200000, full, "DR4"},
+		unix.ETHTOOL_LINK_MODE_200000baseCR4_Full_BIT:         {200000, full, "CR4"},
+		unix.ETHTOOL_LINK_MODE_100baseT1_Full_BIT:             {100, full, "T1"},
+		unix.ETHTOOL_LINK_MODE_1000baseT1_Full_BIT:            {1000, full, "T1"},
+		unix.ETHTOOL_LINK_MODE_400000baseKR8_Full_BIT:         {400000, full, "KR8"},
+		unix.ETHTOOL_LINK_MODE_400000baseSR8_Full_BIT:         {400000, full, "SR8"},
+		unix.ETHTOOL_LINK_MODE_400000baseLR8_ER8_FR8_Full_BIT: {400000, full, "LR8_ER8_FR8"},
+		unix.ETHTOOL_LINK_MODE_400000baseDR8_Full_BIT:         {400000, full, "DR8"},
+		unix.ETHTOOL_LINK_MODE_400000baseCR8_Full_BIT:         {400000, full, "CR8"},
+		unix.ETHTOOL_LINK_MODE_100000baseKR_Full_BIT:          {100000, full, "KR"},
+		unix.ETHTOOL_LINK_MODE_100000baseSR_Full_BIT:          {100000, full, "SR"},
+		unix.ETHTOOL_LINK_MODE_100000baseLR_ER_FR_Full_BIT:    {100000, full, "LR_ER_FR"},
+		unix.ETHTOOL_LINK_MODE_100000baseCR_Full_BIT:          {100000, full, "CR"},
+		unix.ETHTOOL_LINK_MODE_100000baseDR_Full_BIT:          {100000, full, "DR"},
+		unix.ETHTOOL_LINK_MODE_200000baseKR2_Full_BIT:         {200000, full, "KR2"},
+		unix.ETHTOOL_LINK_MODE_200000baseSR2_Full_BIT:         {200000, full, "SR2"},
+		unix.ETHTOOL_LINK_MODE_200000baseLR2_ER2_FR2_Full_BIT: {200000, full, "LR2_ER2_FR2"},
+		unix.ETHTOOL_LINK_MODE_200000baseDR2_Full_BIT:         {200000, full, "DR2"},
+		unix.ETHTOOL_LINK_MODE_200000baseCR2_Full_BIT:         {200000, full, "CR2"},
+		unix.ETHTOOL_LINK_MODE_400000baseKR4_Full_BIT:         {400000, full, "KR4"},
+		unix.ETHTOOL_LINK_MODE_400000baseSR4_Full_BIT:         {400000, full, "SR4"},
+		unix.ETHTOOL_LINK_MODE_400000baseLR4_ER4_FR4_Full_BIT: {400000, full, "LR4_ER4_FR4"},
+		unix.ETHTOOL_LINK_MODE_400000baseDR4_Full_BIT:         {400000, full, "DR4"},
+		unix.ETHTOOL_LINK_MODE_400000baseCR4_Full_BIT:         {400000, full, "CR4"},
+		unix.ETHTOOL_LINK_MODE_100baseFX_Half_BIT:             {100, half, "FX"},
+		unix.ETHTOOL_LINK_MODE_100baseFX_Full_BIT:             {100, full, "FX"},
 	} {
 		if linkModes&(1<<bit) != 0 {
-			ch <- prometheus.MustNewConstMetric(c.entries[linkMode], prometheus.GaugeValue,
+			ch <- prometheus.MustNewConstMetric(c.entry(linkMode), prometheus.GaugeValue,
 				float64(labels.speed)*Mbps, device, labels.duplex, fmt.Sprintf("%dbase%s", labels.speed, labels.phy))
 		}
 	}
@@ -334,7 +391,7 @@ func (c *ethtoolCollector) Update(ch chan<- prometheus.Metric) error {
 			c.updatePortCapabilities(ch, "supported", device, linkInfo.Supported)
 			c.updateSpeeds(ch, "advertised", device, linkInfo.Advertising)
 			c.updatePortCapabilities(ch, "advertised", device, linkInfo.Advertising)
-			ch <- prometheus.MustNewConstMetric(c.entries["autonegotiate"], prometheus.GaugeValue, float64(linkInfo.Autoneg), device)
+			ch <- prometheus.MustNewConstMetric(c.entry("autonegotiate"), prometheus.GaugeValue, float64(linkInfo.Autoneg), device)
 		} else {
 			if errno, ok := err.(syscall.Errno); ok {
 				if err == unix.EOPNOTSUPP {
@@ -385,34 +442,67 @@ func (c *ethtoolCollector) Update(ch chan<- prometheus.Metric) error {
 			continue
 		}
 
+		// Sanitizing the metric names can lead to duplicate metric names. Therefore check for clashes beforehand.
+		metricFQNames := make(map[string]string)
+		for metric := range stats {
+			if !c.metricsPattern.MatchString(metric) {
+				continue
+			}
+			metricFQName := buildEthtoolFQName(metric)
+			existingMetric, exists := metricFQNames[metricFQName]
+			if exists {
+				level.Debug(c.logger).Log("msg", "dropping duplicate metric name", "device", device,
+					"metricFQName", metricFQName, "metric1", existingMetric, "metric2", metric)
+				// Keep the metric as "deleted" in the dict in case there are 3 duplicates.
+				metricFQNames[metricFQName] = ""
+			} else {
+				metricFQNames[metricFQName] = metric
+			}
+		}
+
 		// Sort metric names so that the test fixtures will match up
-		keys := make([]string, 0, len(stats))
-		for k := range stats {
+		keys := make([]string, 0, len(metricFQNames))
+		for k := range metricFQNames {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
 
-		for _, metric := range keys {
-			if !c.metricsPattern.MatchString(metric) {
+		for _, metricFQName := range keys {
+			metric := metricFQNames[metricFQName]
+			if metric == "" {
+				// Skip the "deleted" duplicate metrics
 				continue
 			}
+
 			val := stats[metric]
-			metricFQName := buildEthtoolFQName(metric)
 
 			// Check to see if this metric exists; if not then create it and store it in c.entries.
-			entry, exists := c.entries[metric]
-			if !exists {
-				entry = prometheus.NewDesc(
-					metricFQName,
-					fmt.Sprintf("Network interface %s", metric),
-					[]string{"device"}, nil,
-				)
-				c.entries[metric] = entry
-			}
+			entry := c.entryWithCreate(metric, metricFQName)
 			ch <- prometheus.MustNewConstMetric(
 				entry, prometheus.UntypedValue, float64(val), device)
 		}
 	}
 
 	return nil
+}
+
+func (c *ethtoolCollector) entryWithCreate(key, metricFQName string) *prometheus.Desc {
+	c.entriesMutex.Lock()
+	defer c.entriesMutex.Unlock()
+
+	if _, ok := c.entries[key]; !ok {
+		c.entries[key] = prometheus.NewDesc(
+			metricFQName,
+			fmt.Sprintf("Network interface %s", key),
+			[]string{"device"}, nil,
+		)
+	}
+
+	return c.entries[key]
+}
+
+func (c *ethtoolCollector) entry(key string) *prometheus.Desc {
+	c.entriesMutex.Lock()
+	defer c.entriesMutex.Unlock()
+	return c.entries[key]
 }

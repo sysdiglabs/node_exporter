@@ -30,7 +30,7 @@ type lnstatCollector struct {
 }
 
 func init() {
-	registerCollector("lnstat", defaultEnabled, NewLnstatCollector)
+	registerCollector("lnstat", defaultDisabled, NewLnstatCollector)
 }
 
 func NewLnstatCollector(logger log.Logger) (Collector, error) {
@@ -49,7 +49,7 @@ func (c *lnstatCollector) Update(ch chan<- prometheus.Metric) error {
 
 	netStats, err := fs.NetStat()
 	if err != nil {
-		return fmt.Errorf("Lnstat error: %s", err)
+		return fmt.Errorf("lnstat error: %s", err)
 	}
 
 	for _, netStatFile := range netStats {
