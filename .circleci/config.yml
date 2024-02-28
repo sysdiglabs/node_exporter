@@ -1,36 +1,33 @@
 ---
 version: 2.1
-
 orbs:
-  prometheus: prometheus/prometheus@0.11.0
-
+  prometheus: prometheus/prometheus@0.17.1
 executors:
   # Whenever the Go version is updated here, .promu.yml and .promu-cgo.yml
   # should also be updated.
   golang:
     docker:
-      - image: circleci/golang:1.17
+      - image: cimg/go:1.21
+  arm:
+    machine:
+      image: ubuntu-2204:current
+    resource_class: arm.medium
 
 jobs:
   test:
     executor: golang
-
     steps:
       - prometheus/setup_environment
       - run: go mod download
       - run: make
       - prometheus/store_artifact:
           file: node_exporter
-
-  codespell:
-    docker:
-      - image: circleci/python
-
+  test-arm:
+    executor: arm
     steps:
       - checkout
-      - run: sudo pip install codespell
-      - run: codespell --skip=".git,./vendor,ttar,go.mod,go.sum,*pem,./collector/fixtures" -L uint,packages\',uptodate
-
+      - run: uname -a
+      - run: make test-e2e
   test_mixins:
     executor: golang
     steps:
@@ -43,16 +40,13 @@ jobs:
       - run: make -C docs/node-mixin jb_install
       - run: make -C docs/node-mixin
       - run: git diff --exit-code
-
   build:
     machine:
-      image: ubuntu-2004:202101-01
-
+      image: ubuntu-2204:current
     parallelism: 3
-
     steps:
       - prometheus/setup_environment
-      - run: docker run --privileged linuxkit/binfmt:v0.8
+      - run: docker run --privileged linuxkit/binfmt:af88a591f9cc896a52ce596b9cf7ca26a061ef97
       - run: promu crossbuild -v --parallelism $CIRCLE_NODE_TOTAL --parallelism-thread $CIRCLE_NODE_INDEX
       - run: promu --config .promu-cgo.yml crossbuild -v --parallelism $CIRCLE_NODE_TOTAL --parallelism-thread $CIRCLE_NODE_INDEX
       - persist_to_workspace:
@@ -62,15 +56,12 @@ jobs:
       - store_artifacts:
           path: .build
           destination: /build
-
   test_docker:
     machine:
-      image: ubuntu-2004:202101-01
-
+      image: ubuntu-2204:current
     environment:
-      DOCKER_TEST_IMAGE_NAME: quay.io/prometheus/golang-builder:1.16-base
+      DOCKER_TEST_IMAGE_NAME: quay.io/prometheus/golang-builder:1.21-base
       REPO_PATH: github.com/prometheus/node_exporter
-
     steps:
       - prometheus/setup_environment
       - attach_workspace:
@@ -91,7 +82,6 @@ jobs:
             else
               make test-docker
             fi
-
 workflows:
   version: 2
   node_exporter:
@@ -100,11 +90,11 @@ workflows:
           filters:
             tags:
               only: /.*/
-      - build:
+      - test-arm:
           filters:
             tags:
               only: /.*/
-      - codespell:
+      - build:
           filters:
             tags:
               only: /.*/
